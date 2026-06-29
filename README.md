@@ -1,3 +1,5 @@
+# My version, I will describe more later.
+
 # This is a modified version of the ducalex's retro-go [ducalex's retro-go](https://github.com/ducalex/retro-go) fimware with an updated display. This firmware is suitable with the latest IPS dispays with ST7789/ST7789V drivers.
 # Table of contents
 - [Description](#description)
