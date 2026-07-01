@@ -36,10 +36,411 @@ static void lcd_set_window(int left, int top, int width, int height);
 static inline uint16_t *lcd_get_buffer(size_t length);
 static inline void lcd_send_buffer(uint16_t *buffer, size_t length);
 
+<<<<<<< HEAD
 #if RG_SCREEN_DRIVER == 0 || RG_SCREEN_DRIVER == 1 /* ILI9341/ST7789 */
 #include "drivers/display/ili9341.h"
 #elif RG_SCREEN_DRIVER == 99
 #include "drivers/display/sdl2.h"
+=======
+
+static inline uint16_t *spi_get_buffer(void)
+{
+    uint16_t *buffer;
+    if (xQueueReceive(spi_buffers, &buffer, pdMS_TO_TICKS(2500)) != pdTRUE)
+        RG_PANIC("display");
+    return buffer;
+}
+
+static inline void spi_queue_transaction(const void *data, size_t length, uint32_t type)
+{
+    spi_transaction_t *t;
+
+    if (!data || length < 1)
+        return;
+
+    xQueueReceive(spi_transactions, &t, portMAX_DELAY);
+
+    *t = (spi_transaction_t){
+        .tx_buffer = NULL,
+        .length = length * 8, // In bits
+        .user = (void *)type,
+        .flags = 0,
+    };
+
+    if (type & 2)
+    {
+        t->tx_buffer = data;
+    }
+    else if (length < 5)
+    {
+        memcpy(t->tx_data, data, length);
+        t->flags = SPI_TRANS_USE_TXDATA;
+    }
+    else
+    {
+        t->tx_buffer = memcpy(spi_get_buffer(), data, length);
+    }
+
+    if (spi_device_queue_trans(spi_dev, t, pdMS_TO_TICKS(2500)) != ESP_OK)
+    {
+        RG_PANIC("display");
+    }
+}
+
+IRAM_ATTR
+static void spi_pre_transfer_cb(spi_transaction_t *t)
+{
+    // Set the data/command line accordingly
+    gpio_set_level(RG_GPIO_LCD_DC, (int)t->user & 1);
+}
+
+IRAM_ATTR
+static void spi_task(void *arg)
+{
+    spi_transaction_t *t;
+
+    while (spi_device_get_trans_result(spi_dev, &t, portMAX_DELAY) == ESP_OK)
+    {
+        if ((int)t->user & 2)
+            xQueueSend(spi_buffers, &t->tx_buffer, 0);
+        xQueueSend(spi_transactions, &t, 0);
+    }
+
+    // This should never happen
+    rg_task_delete(NULL);
+}
+
+static void spi_init(void)
+{
+    spi_transactions = xQueueCreate(SPI_TRANSACTION_COUNT, sizeof(spi_transaction_t *));
+    spi_buffers = xQueueCreate(SPI_BUFFER_COUNT, sizeof(uint16_t *));
+
+    while (uxQueueSpacesAvailable(spi_transactions))
+    {
+        void *trans = malloc(sizeof(spi_transaction_t));
+        xQueueSend(spi_transactions, &trans, portMAX_DELAY);
+    }
+
+    while (uxQueueSpacesAvailable(spi_buffers))
+    {
+        void *buffer = rg_alloc(SPI_BUFFER_LENGTH * 2, MEM_DMA);
+        xQueueSend(spi_buffers, &buffer, portMAX_DELAY);
+    }
+
+    const spi_bus_config_t buscfg = {
+        .miso_io_num = RG_GPIO_LCD_MISO,
+        .mosi_io_num = RG_GPIO_LCD_MOSI,
+        .sclk_io_num = RG_GPIO_LCD_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+    };
+
+    const spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = RG_SCREEN_SPEED,   // Typically SPI_MASTER_FREQ_40M or SPI_MASTER_FREQ_80M
+        .mode = 0,                           // SPI mode 0
+        .spics_io_num = RG_GPIO_LCD_CS,      // CS pin
+        .queue_size = SPI_TRANSACTION_COUNT, // We want to be able to queue 5 transactions at a time
+        .pre_cb = &spi_pre_transfer_cb,      // Specify pre-transfer callback to handle D/C line and SPI lock
+        .flags = SPI_DEVICE_NO_DUMMY,        // SPI_DEVICE_HALFDUPLEX;
+    };
+
+    esp_err_t ret;
+
+    // Initialize the SPI bus
+    ret = spi_bus_initialize(RG_SCREEN_HOST, &buscfg, SPI_DMA_CH_AUTO);
+    RG_ASSERT(ret == ESP_OK || ret == ESP_ERR_INVALID_STATE, "spi_bus_initialize failed.");
+
+    ret = spi_bus_add_device(RG_SCREEN_HOST, &devcfg, &spi_dev);
+    RG_ASSERT(ret == ESP_OK, "spi_bus_add_device failed.");
+
+    rg_task_create("rg_spi", &spi_task, NULL, 1.5 * 1024, RG_TASK_PRIORITY - 1, 1);
+}
+
+static void spi_deinit(void)
+{
+    spi_bus_remove_device(spi_dev);
+    spi_bus_free(RG_SCREEN_HOST);
+}
+
+static void ili9341_cmd(uint8_t cmd, const void *data, size_t data_len)
+{
+    spi_queue_transaction(&cmd, 1, 0);
+    if (data && data_len > 0)
+        spi_queue_transaction(data, data_len, 1);
+    // if ((cmd & 0xE0) == 0x00)
+    //     usleep(5000);
+}
+
+static void lcd_set_backlight(double percent)
+{
+    double level = RG_MIN(RG_MAX(percent / 100.0, 0), 1.0);
+    int error_code = 0;
+
+#if defined(RG_GPIO_LCD_BCKL)
+    error_code = ledc_set_fade_time_and_start(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, 0x1FFF * level, 50, 0);
+#elif defined(RG_TARGET_QTPY_GAMER)
+    // error_code = aw_analogWrite(AW_TFT_BACKLIGHT, level * 255);
+#endif
+
+    if (error_code)
+        RG_LOGE("failed setting backlight to %.2f%% (0x%02X)\n", 100 * level, error_code);
+    else
+        RG_LOGI("backlight set to %.2f%%\n", 100 * level);
+}
+
+static void lcd_init(void)
+{
+#if defined(RG_GPIO_LCD_BCKL)
+    // Initialize backlight at 0% to avoid the lcd reset flash
+    ledc_timer_config(&(ledc_timer_config_t){
+        .duty_resolution = LEDC_TIMER_13_BIT,
+        .freq_hz = 5000,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_num = LEDC_TIMER_0,
+    });
+    ledc_channel_config(&(ledc_channel_config_t){
+        .channel = LEDC_CHANNEL_0,
+        .duty = 0,
+        .gpio_num = RG_GPIO_LCD_BCKL,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_sel = LEDC_TIMER_0,
+    });
+    ledc_fade_func_install(0);
+#endif
+
+    spi_init();
+
+    // Setup Data/Command line
+    gpio_set_direction(RG_GPIO_LCD_DC, GPIO_MODE_OUTPUT);
+    gpio_set_level(RG_GPIO_LCD_DC, 1);
+
+#if defined(RG_GPIO_LCD_RST)
+    gpio_set_direction(RG_GPIO_LCD_RST, GPIO_MODE_OUTPUT);
+    gpio_set_level(RG_GPIO_LCD_RST, 0);
+    usleep(100 * 1000);
+    gpio_set_level(RG_GPIO_LCD_RST, 1);
+    usleep(10 * 1000);
+#endif
+
+#define ILI9341_CMD(cmd, data...) {const uint8_t x[] = data; ili9341_cmd(cmd, x, sizeof(x));}
+#if RG_SCREEN_TYPE == 0 // LCD Model (ODROID-GO)
+
+ILI9341_CMD(0x01, {});     // Reset
+    ILI9341_CMD(0x3A, {0x55}); // Pixel Format Set RGB565
+    ILI9341_CMD(0xCF, {0x00, 0xc3, 0x30});
+    ILI9341_CMD(0xED, {0x64, 0x03, 0x12, 0x81});
+    ILI9341_CMD(0xE8, {0x85, 0x00, 0x78});
+    ILI9341_CMD(0xCB, {0x39, 0x2c, 0x00, 0x34, 0x02});
+    ILI9341_CMD(0xF7, {0x20});
+    ILI9341_CMD(0xEA, {0x00, 0x00});
+    ILI9341_CMD(0xC0, {0x1B});                                  // Power control   //VRH[5:0]
+    ILI9341_CMD(0xC1, {0x12});                                  // Power control   //SAP[2:0];BT[3:0]
+    ILI9341_CMD(0xC5, {0x32, 0x3C});                            // VCM control
+    ILI9341_CMD(0xC7, {0x91});                                  // VCM control2
+    ILI9341_CMD(0x36, {(0x00|0x00|0x08)});                      // Memory Access Control
+    ILI9341_CMD(0xB1, {0x00, 0x10});                            // Frame Rate Control (1B=70, 1F=61, 10=119)
+    ILI9341_CMD(0xB6, {0x0A, 0xA2});                            // Display Function Control
+    ILI9341_CMD(0xF6, {0x01, 0x30});
+    ILI9341_CMD(0xF2, {0x00});                                  // 3Gamma Function Disable
+    ILI9341_CMD(0x26, {0x01});                                  // Gamma curve selected
+    
+    //ILI9341_CMD(0xE0, {0x0F, 0x31, 0x2B, 0x0C, 0x0E, 0x08, 0x4E, 0xF1, 0x37, 0x07, 0x10, 0x03, 0x0E, 0x09, 0x00}); // Set Gamma
+    //ILI9341_CMD(0xE1, {0x00, 0x0E, 0x14, 0x03, 0x11, 0x07, 0x31, 0xC1, 0x48, 0x08, 0x0F, 0x0C, 0x31, 0x36, 0x0F}); // Set Gamma
+    ILI9341_CMD(0xE0, {0xD0, 0x00, 0x05, 0x0E, 0x15, 0x0D, 0x37, 0x43, 0x47, 0x09, 0x15, 0x12, 0x16, 0x19}); // Set Gamma
+    ILI9341_CMD(0xE1, {0xD0, 0x00, 0x05, 0x0D, 0x0C, 0x06, 0x2D, 0x44, 0x40, 0x0E, 0x1C, 0x18, 0x16, 0x19}); // Set Gamma
+    ILI9341_CMD(0x11, {}); // Exit Sleep
+    ILI9341_CMD(0x29, {}); // Display on
+ 
+
+/*
+    ILI9341_CMD(0x01, {});     // Reset
+    ILI9341_CMD(0x13, {});     // NORON
+    
+    ILI9341_CMD(0xCF, {0x00, 0xc3, 0x30});
+    ILI9341_CMD(0xED, {0x64, 0x03, 0x12, 0x81});
+    ILI9341_CMD(0xE8, {0x85, 0x00, 0x78});
+    ILI9341_CMD(0xCB, {0x39, 0x2c, 0x00, 0x34, 0x02});
+    ILI9341_CMD(0xF7, {0x20});
+    ILI9341_CMD(0xEA, {0x00, 0x00});
+    ILI9341_CMD(0xC0, {0x1B});                                  // Power control   //VRH[5:0]
+    ILI9341_CMD(0xC1, {0x12});                                  // Power control   //SAP[2:0];BT[3:0]
+    ILI9341_CMD(0xC5, {0x32, 0x3C});                            // VCM control
+    ILI9341_CMD(0xC7, {0x91});                                  // VCM control2
+    ILI9341_CMD(0x36, {(0x00|0x00|0x08)});                      // Memory Access Control
+    
+    ILI9341_CMD(0x3A, {0x55}); // Pixel Format Set RGB565
+    ILI9341_CMD(0x0c, {0x0c, 0x00, 0x33, 0x33});
+    ILI9341_CMD(0xB7, {0x72});
+    ILI9341_CMD(0xBB, {0x3d});
+    ILI9341_CMD(0xC0, {0x2C});                                  // Power control 
+    ILI9341_CMD(0xC2, {0x01, 0xFF});
+    ILI9341_CMD(0xC3, {0x19});
+    ILI9341_CMD(0xC4, {0x20});
+    ILI9341_CMD(0xC6, {0x0f});
+    ILI9341_CMD(0xD0, {0xA4, 0xA1});
+    ILI9341_CMD(0xE0, {0xD0, 0x00, 0x05, 0x0E, 0x15, 0x0D, 0x37, 0x43, 0x47, 0x09, 0x15, 0x12, 0x16, 0x19}); // Set Gamma
+    ILI9341_CMD(0xE1, {0xD0, 0x00, 0x05, 0x0D, 0x0C, 0x06, 0x2D, 0x44, 0x40, 0x0E, 0x1C, 0x18, 0x16, 0x19}); // Set Gamma
+    ILI9341_CMD(0x21, {0x80});   
+    ILI9341_CMD(0x11, {0x80}); // Exit Sleep
+    ILI9341_CMD(0x29, {0x80}); // Display on
+    
+    ILI9341_CMD(0x01, {});     // Reset
+    ILI9341_CMD(0x13, {});     // NORON
+    
+    ILI9341_CMD(0xCF, {0x00, 0xc3, 0x30});
+    ILI9341_CMD(0xED, {0x64, 0x03, 0x12, 0x81});
+    ILI9341_CMD(0xE8, {0x85, 0x00, 0x78});
+    ILI9341_CMD(0xCB, {0x39, 0x2c, 0x00, 0x34, 0x02});
+    ILI9341_CMD(0xF7, {0x20});
+    ILI9341_CMD(0xEA, {0x00, 0x00});
+    ILI9341_CMD(0xC0, {0x1B});                                  // Power control   //VRH[5:0]
+    ILI9341_CMD(0xC1, {0x12});                                  // Power control   //SAP[2:0];BT[3:0]
+    ILI9341_CMD(0xC5, {0x32, 0x3C});                            // VCM control
+    ILI9341_CMD(0xC7, {0x91});                                  // VCM control2
+    ILI9341_CMD(0x36, {(0x00|0x00|0x08)});                      // Memory Access Control
+    ILI9341_CMD(0xB1, {0x00, 0x10});                            // Frame Rate Control (1B=70, 1F=61, 10=119)
+    ILI9341_CMD(0xB6, {0x0A, 0xA2});                            // Display Function Control
+    ILI9341_CMD(0xF6, {0x01, 0x30});
+    ILI9341_CMD(0xF2, {0x00});                                  // 3Gamma Function Disable
+    ILI9341_CMD(0x26, {0x01});                                  // Gamma curve selected
+    
+    ILI9341_CMD(0xB0, {0x00, 0xE0});
+    ILI9341_CMD(0x3A, {0x55}); 
+    usleep(10 * 10);
+    ILI9341_CMD(0xB2, {0x0C, 0x0C, 0x00, 0x33, 0x03});
+    ILI9341_CMD(0xB7, {0x35});
+    ILI9341_CMD(0xBB, {0x28});
+    //ILI9341_CMD(0xC0, {0x0C});
+    ILI9341_CMD(0xC2, {0x01, 0xFF});
+    ILI9341_CMD(0xC3, {0x10});
+    ILI9341_CMD(0xC4, {0x20});
+    ILI9341_CMD(0xC6, {0x0F});
+    ILI9341_CMD(0xD0, {0xA4, 0xA1});
+    //ILI9341_CMD(0xE0, {0xD0, 0x00, 0x02, 0x07, 0x0A, 0x28, 0x32, 0x44, 0x42, 0x06, 0x0E, 0x12, 0x14, 0x17}); // Set Gamma
+    //ILI9341_CMD(0xE1, {0xD0, 0x00, 0x02, 0x07, 0x0A, 0x28, 0x31, 0x54, 0x47, 0x0E, 0x1C, 0x17, 0x1B, 0x1E}); // Set Gamma
+    
+    ILI9341_CMD(0xE0, {0xD0, 0x00, 0x05, 0x0E, 0x15, 0x0D, 0x37, 0x43, 0x47, 0x09, 0x15, 0x12, 0x16, 0x19}); // Set Gamma
+    ILI9341_CMD(0xE1, {0xD0, 0x00, 0x05, 0x0D, 0x0C, 0x06, 0x2D, 0x44, 0x40, 0x0E, 0x1C, 0x18, 0x16, 0x19}); // Set Gamma
+    ILI9341_CMD(0x21, {});    
+    ILI9341_CMD(0x2A, {0x00, 0x00, 0x00, 0xEF});
+    ILI9341_CMD(0x2B, {0x00, 0x00, 0x01, 0x3F});
+    ILI9341_CMD(0x11, {}); // Exit Sleep
+    ILI9341_CMD(0x29, {}); // Display on
+   
+    
+    ILI9341_CMD(0xCF, {0x00, 0xc3, 0x30});
+    ILI9341_CMD(0xED, {0x64, 0x03, 0x12, 0x81});
+    ILI9341_CMD(0xE8, {0x85, 0x00, 0x78});
+    ILI9341_CMD(0xCB, {0x39, 0x2c, 0x00, 0x34, 0x02});
+    ILI9341_CMD(0xF7, {0x20});
+    ILI9341_CMD(0xEA, {0x00, 0x00});
+    ILI9341_CMD(0xC0, {0x1B});                                  // Power control   //VRH[5:0]
+    ILI9341_CMD(0xC1, {0x12});                                  // Power control   //SAP[2:0];BT[3:0]
+    ILI9341_CMD(0xC5, {0x32, 0x3C});                            // VCM control
+    ILI9341_CMD(0xC7, {0x91});                                  // VCM control2
+    ILI9341_CMD(0x36, {(0x00|0x00|0x08)});                      // Memory Access Control
+    ILI9341_CMD(0xB1, {0x00, 0x10});                            // Frame Rate Control (1B=70, 1F=61, 10=119)
+    ILI9341_CMD(0xB6, {0x0A, 0xA2});                            // Display Function Control
+    ILI9341_CMD(0xF6, {0x01, 0x30});
+    ILI9341_CMD(0xF2, {0x00});                                  // 3Gamma Function Disable
+    ILI9341_CMD(0x26, {0x01});                                  // Gamma curve selected
+    ILI9341_CMD(0xE0, {0x0F, 0x31, 0x2B, 0x0C, 0x0E, 0x08, 0x4E, 0xF1, 0x37, 0x07, 0x10, 0x03, 0x0E, 0x09, 0x00}); // Set Gamma
+    ILI9341_CMD(0xE1, {0x00, 0x0E, 0x14, 0x03, 0x11, 0x07, 0x31, 0xC1, 0x48, 0x08, 0x0F, 0x0C, 0x31, 0x36, 0x0F}); // Set Gamma
+    ILI9341_CMD(0x11, {}); // Exit Sleep
+    ILI9341_CMD(0x29, {}); // Display on
+    */
+#elif RG_SCREEN_TYPE == 1 // LCD Model (MRGC-G32)
+    ILI9341_CMD(0x01, {});     // Reset
+    ILI9341_CMD(0x3A, {0x55}); // Pixel Format Set RGB565
+    ILI9341_CMD(0x36, {(0x00|0x00|0x00)});
+    ILI9341_CMD(0xB1, {0x00, 0x10});                            // Frame Rate Control (1B=70, 1F=61, 10=119)
+    ILI9341_CMD(0xB2, {0x0c, 0x0c, 0x00, 0x33, 0x33});
+    ILI9341_CMD(0xB7, {0x35});
+    ILI9341_CMD(0xBB, {0x24});
+    ILI9341_CMD(0xC0, {0x2C});
+    ILI9341_CMD(0xC2, {0x01, 0xFF});
+    ILI9341_CMD(0xC3, {0x11});
+    ILI9341_CMD(0xC4, {0x20});
+    ILI9341_CMD(0xC6, {0x0f});
+    ILI9341_CMD(0xD0, {0xA4, 0xA1});
+    ILI9341_CMD(0xE0, {0xD0, 0x00, 0x03, 0x09, 0x13, 0x1C, 0x3A, 0x55, 0x48, 0x18, 0x12, 0x0E, 0x19, 0x1E});
+    ILI9341_CMD(0xE1, {0xD0, 0x00, 0x03, 0x09, 0x05, 0x25, 0x3A, 0x55, 0x50, 0x3D, 0x1C, 0x1D, 0x1D, 0x1E});
+    ILI9341_CMD(0x11, {}); // Exit Sleep
+    ILI9341_CMD(0x29, {}); // Display on
+#elif RG_SCREEN_TYPE == 2 // LCD Model (QT-PY Gamer)
+    ILI9341_CMD(0x01, {});     // Reset
+    ILI9341_CMD(0x11, {}); // Exit Sleep
+    ILI9341_CMD(0x3A, {0x55}); // Pixel Format Set RGB565
+    ILI9341_CMD(0x36, {0xC0});
+    ILI9341_CMD(0x2A, {0, 0, 0, 240}); // CASET
+    ILI9341_CMD(0x2B, {0, 0, 320>>8, 320&0xFF}); // RASET
+    ILI9341_CMD(0x21, {});
+    ILI9341_CMD(0x29, {}); // Display on
+#elif RG_SCREEN_TYPE == 32 // LCD Model (Retro-ESP32)
+    ILI9341_CMD(0x01, {});     // Reset
+    ILI9341_CMD(0x3A, {0x55}); // Pixel Format Set RGB565
+    ILI9341_CMD(0xCF, {0x00, 0xc3, 0x30});
+    ILI9341_CMD(0xED, {0x64, 0x03, 0x12, 0x81});
+    ILI9341_CMD(0xE8, {0x85, 0x00, 0x78});
+    ILI9341_CMD(0xCB, {0x39, 0x2c, 0x00, 0x34, 0x02});
+    ILI9341_CMD(0xF7, {0x20});
+    ILI9341_CMD(0xEA, {0x00, 0x00});
+    ILI9341_CMD(0xC0, {0x1B});                                  // Power control   //VRH[5:0]
+    ILI9341_CMD(0xC1, {0x12});                                  // Power control   //SAP[2:0];BT[3:0]
+    ILI9341_CMD(0xC5, {0x32, 0x3C});                            // VCM control
+    ILI9341_CMD(0xC7, {0x91});                                  // VCM control2
+    ILI9341_CMD(0x36, {(0x20|0x80|0x08)});                      // Memory Access Control
+    ILI9341_CMD(0x36, {(0x40|0x80|0x08)});                      // Memory Access Control
+    //ILI9341_CMD(0x21, {0x80});                                  // invert colors
+    ILI9341_CMD(0xB1, {0x00, 0x10});                            // Frame Rate Control (1B=70, 1F=61, 10=119)
+    ILI9341_CMD(0xB6, {0x0A, 0xA2});                            // Display Function Control
+    ILI9341_CMD(0xF6, {0x01, 0x30});
+    ILI9341_CMD(0xF2, {0x00});                                  // 3Gamma Function Disable
+    ILI9341_CMD(0x26, {0x01});                                  // Gamma curve selected
+    ILI9341_CMD(0xE0, {0x0F, 0x31, 0x2B, 0x0C, 0x0E, 0x08, 0x4E, 0xF1, 0x37, 0x07, 0x10, 0x03, 0x0E, 0x09, 0x00}); // Set Gamma
+    ILI9341_CMD(0xE1, {0x00, 0x0E, 0x14, 0x03, 0x11, 0x07, 0x31, 0xC1, 0x48, 0x08, 0x0F, 0x0C, 0x31, 0x36, 0x0F}); // Set Gamma
+    ILI9341_CMD(0x11, {}); // Exit Sleep
+    ILI9341_CMD(0x29, {}); // Display on
+#elif RG_SCREEN_TYPE == 4
+	ILI9341_CMD(0x01, {});  // Reset
+	usleep(120 * 1000);
+	ILI9341_CMD(0x3A, {0X05});  //65k mode
+	ILI9341_CMD(0xC5, {0x1A}); //VCOM
+	ILI9341_CMD(0x36, {0x60}); //Display Rotation
+	ILI9341_CMD(0xB2, {0x05, 0x05, 0x00, 0x33, 0x33});  //Porch Setting
+	ILI9341_CMD(0xB7, {0x05});  //Gate Control //12.2v   -10.43v
+	ILI9341_CMD(0xBB, {0x3F});  //VCOM
+	ILI9341_CMD(0xC0, {0x2c});  //Power control
+	ILI9341_CMD(0xC2, {0x01});  //VDV and VRH Command Enable
+	ILI9341_CMD(0xC3, {0x0F});  //VRH Set 4.3+( vcom+vcom offset+vdv)
+	ILI9341_CMD(0xC4, {0xBE});  //VDV Set 0v
+	ILI9341_CMD(0xC6, {0X01});  //Frame Rate Control in Normal Mode 111Hz
+	ILI9341_CMD(0xD0, {0xA4,0xA1});  //Power Control 1
+	ILI9341_CMD(0xE8, {0x03});   //Power Control 1
+	ILI9341_CMD(0xE9, {0x09,0x09,0x08});  //Equalize time control
+	ILI9341_CMD(0xE0, {0xD0,0x05,0x09,0x09,0x08,0x14,0x28,0x33,0x3F,0x07,0x13,0x14,0x28,0x30});   //Set Gamma
+	ILI9341_CMD(0xE1, {0xD0, 0x05, 0x09, 0x09, 0x08, 0x03, 0x24, 0x32, 0x32, 0x3B, 0x14, 0x13, 0x28, 0x2F, 0x1F});   //Set Gamma
+	ILI9341_CMD(0x20, {0x00});   //Reverse Display
+	ILI9341_CMD(0x11, {0x03});   //Exit Sleep
+	ILI9341_CMD(0x29, {0x03});   //Display on
+	usleep(100 * 1000);
+#elif RG_SCREEN_TYPE == 5 // Game Box Mini Screen
+    ILI9341_CMD(0x3A, {0x55}); // Pixel Format Set RGB565
+    ILI9341_CMD(0x0c, {0x0c, 0x00, 0x33, 0x33});
+    ILI9341_CMD(0xB7, {0x72});
+    ILI9341_CMD(0xBB, {0x3d});
+    ILI9341_CMD(0xC0, {0x2C});                                  // Power control 
+    ILI9341_CMD(0xC2, {0x01, 0xFF});
+    ILI9341_CMD(0xC3, {0x19});
+    ILI9341_CMD(0xC4, {0x20});
+    ILI9341_CMD(0xC6, {0x0f});
+    ILI9341_CMD(0xD0, {0xA4, 0xA1});
+    ILI9341_CMD(0xE0, {0xD0, 0x00, 0x05, 0x0E, 0x15, 0x0D, 0x37, 0x43, 0x47, 0x09, 0x15, 0x12, 0x16, 0x19}); // Set Gamma
+    ILI9341_CMD(0xE1, {0xD0, 0x00, 0x05, 0x0D, 0x0C, 0x06, 0x2D, 0x44, 0x40, 0x0E, 0x1C, 0x18, 0x16, 0x19}); // Set Gamma
+    ILI9341_CMD(0x21, {0x80});   
+    ILI9341_CMD(0x11, {0x80}); // Exit Sleep
+    ILI9341_CMD(0x29, {0x80}); // Display on
+>>>>>>> 2493140b182650d5336d24bdda1356a799aa14a8
 #else
 #include "drivers/display/dummy.h"
 #endif
